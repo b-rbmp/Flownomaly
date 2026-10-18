@@ -1,0 +1,35 @@
+# Python environments, bytecode, and build artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+
+# Tool caches and test output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local datasets and generated experiment output
+/data/
+/datasets/
+/results/
+/checkpoints/
+/anomaly_maps/
+/feature_cache/
+/logs/
+*.pt
+*.pth
+*.h5
+*.h5.incomplete
+
+# Local configuration and OS files
+.env
+.env.*
+!.env.example
+.DS_Store
+._*
