@@ -1,14 +1,21 @@
-# Flownomaly: Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection (WACV 2027)
+<h1 align="center">Flownomaly</h1>
 
-This repository contains the official implementation of the paper:
+<p align="center"><a href="https://arxiv.org/pdf/2610.32964"><b>Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection (WACV 2027)</b></a></p>
 
-> [**Flownomaly: Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection (WACV 2027)** — Paper (TO BE ADDED)](https://arxiv.org/abs/TO_BE_ADDED)
+<p align="center">Bernardo Perrone Ribeiro &middot; Erkut Akdag &middot; Egor Bondarev</p>
+
+<p align="center">
+  AIMS Group, Department of Electrical Engineering<br>
+  Eindhoven University of Technology
+</p>
+
+<p align="center">Official implementation &middot; <a href="https://arxiv.org/pdf/2610.32964">arXiv</a></p>
 
 ---
 
 <p align="center"><img src="assets/flownomaly_overview.png" alt="Flownomaly overview" width="85%"></p>
 
-Figure 1. Flownomaly learns a conditional flow-matching field from normal support features, selects an operating time using normal-only calibration, and detects anomalies through single-step recovery residuals.
+<p><i>Figure 1. Flownomaly learns a conditional flow-matching field from normal support features, selects an operating time using normal-only calibration, and detects anomalies through single-step recovery residuals.</i></p>
 
 ## Introduction
 
