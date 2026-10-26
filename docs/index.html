@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Flownomaly: single-step normal-counterpart recovery for few-shot industrial anomaly detection. WACV 2027. Paper, code, method overview, and results.">
+  <title>Flownomaly | Few-Shot Anomaly Detection</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip-link" href="#overview">Skip to content</a>
+
+  <header class="hero container">
+    <h1><span class="project-name">Flownomaly:</span> Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection</h1>
+    <p class="venue">WACV 2027</p>
+    <p class="authors">Bernardo Perrone Ribeiro<span aria-hidden="true">, </span><br class="mobile-break">Erkut Akdag<span aria-hidden="true">, </span><br class="mobile-break">Egor Bondarev</p>
+    <p class="affiliation">AIMS Group, Department of Electrical Engineering,<br class="mobile-break"> Eindhoven University of Technology</p>
+
+    <nav class="paper-links" aria-label="Paper resources">
+      <a class="button" href="https://arxiv.org/pdf/2610.32964">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5M8 12h8M8 16h8"/></svg>
+        arXiv
+      </a>
+      <a class="button" href="https://github.com/b-rbmp/Flownomaly">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 6-6 6 6 6m8-12 6 6-6 6M14 4l-4 16"/></svg>
+        Code
+      </a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section id="overview" aria-labelledby="overview-title">
+      <h2 id="overview-title">Overview</h2>
+      <p><strong>Flownomaly</strong> detects and localizes industrial anomalies from only a few normal support images. It learns a category-specific conditional flow-matching field in frozen DINOv2 feature space and uses a single recovery step to estimate a query token's normal counterpart. The squared recovery residual provides the anomaly signal.</p>
+      <p>A normal-only <strong>Jacobian gain-to-noise (JGN)</strong> criterion selects the operating time using normal calibration views. At inference, the method requires just one evaluation of the learned field, without trajectory integration.</p>
+
+      <figure>
+        <a class="figure-link" href="assets/flownomaly_overview.png" aria-label="View the Flownomaly method overview at full resolution">
+          <img src="assets/flownomaly_overview.png" width="2200" height="838" alt="Flownomaly pipeline: normal support views pass through frozen DINOv2 features for conditional flow-matching training, checkpoint selection, and normal-only time calibration. Query features are mixed with noise and recovered in one step to produce anomaly maps.">
+        </a>
+        <figcaption><strong>Method overview.</strong> Left: support-only field learning, checkpoint selection, and time calibration. Right: single-step recovery and anomaly scoring. Select the figure to view it at full resolution.</figcaption>
+      </figure>
+    </section>
+
+    <section id="results" aria-labelledby="results-title">
+      <h2 id="results-title">Results</h2>
+      <p>Flownomaly is evaluated on MVTec-AD, VisA, and Real-IAD. The table shows one-shot AUROC percentages, reported as mean &plusmn; standard deviation over three seeds after averaging across categories.</p>
+
+      <div class="table-wrapper" role="region" aria-label="One-shot benchmark results" tabindex="0">
+        <table>
+          <caption>One-shot anomaly detection and localization</caption>
+          <thead>
+            <tr><th scope="col">Dataset</th><th scope="col">Normal support per category</th><th scope="col">Image AUROC</th><th scope="col">Pixel AUROC</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">MVTec-AD</th><td>1 image</td><td><strong>97.8 &plusmn; 0.9</strong></td><td><strong>98.0 &plusmn; 0.1</strong></td></tr>
+            <tr><th scope="row">VisA</th><td>1 image</td><td><strong>95.3 &plusmn; 0.7</strong></td><td><strong>98.7 &plusmn; 0.0</strong></td></tr>
+            <tr><th scope="row">Real-IAD</th><td>1 sample (5 views)</td><td><strong>88.2 &plusmn; 0.2</strong></td><td><strong>99.2 &plusmn; 0.0</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="results-note">Real-IAD uses sample-shot support, with detection evaluated per image. Results for 2- and 4-shot settings are available in the <a href="https://arxiv.org/pdf/2610.32964">paper</a> and <a href="https://github.com/b-rbmp/Flownomaly#benchmark-results">repository</a>.</p>
+
+      <figure>
+        <a class="figure-link" href="assets/qualitative.png" aria-label="View the qualitative anomaly localization comparison at full resolution">
+          <img src="assets/qualitative.png" width="2000" height="632" loading="lazy" alt="One-shot anomaly localization on MVTec-AD and VisA, comparing query images, ground-truth masks, AnomalyDINO, SubspaceAD, and Flownomaly for bottle, cable, nut, fryum, macaroni, and PCB examples.">
+        </a>
+        <figcaption><strong>Qualitative results.</strong> One-shot localization on MVTec-AD (left) and VisA (right), comparing AnomalyDINO, SubspaceAD, and Flownomaly. Select the figure to view it at full resolution.</figcaption>
+      </figure>
+    </section>
+
+    <section id="citation" aria-labelledby="citation-title">
+      <h2 id="citation-title">Citation</h2>
+      <p>If you find this work useful, please consider citing the paper:</p>
+      <pre tabindex="0" aria-label="BibTeX citation"><code>To be added.</code></pre>
+    </section>
+  </main>
+
+  <footer class="container">
+    <p>This work is supported by the STRUCTURE ITEA 24017 project.</p>
+    <p>&copy; 2026 &middot; Flownomaly</p>
+  </footer>
+</body>
+</html>
