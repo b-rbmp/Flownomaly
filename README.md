@@ -7,7 +7,7 @@
   Eindhoven University of Technology
 </p>
 
-<p align="center">Official implementation &middot; <a href="https://arxiv.org/pdf/2610.32964">Paper Link</a></p>
+<p align="center">Official implementation &middot; <a href="https://arxiv.org/pdf/2610.32964">Paper Link</a> &middot; <a href="https://b-rbmp.github.io/Flownomaly/">Project Page</a></p>
 
 ---
 
