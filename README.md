@@ -1,4 +1,4 @@
-<h1 align="center"><a href="https://arxiv.org/pdf/2610.32964">Flownomaly: Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection (WACV 2027)</a></h1>
+<h1 align="center">Flownomaly: Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection (WACV 2027)</h1>
 
 <p align="center">Bernardo Perrone Ribeiro &middot; Erkut Akdag &middot; Egor Bondarev</p>
 
@@ -7,7 +7,7 @@
   Eindhoven University of Technology
 </p>
 
-<p align="center">Official implementation &middot; <a href="https://arxiv.org/pdf/2610.32964">arXiv</a></p>
+<p align="center">Official implementation &middot; <a href="https://arxiv.org/pdf/2610.32964">Paper Link</a></p>
 
 ---
 
