@@ -158,14 +158,11 @@ Each support sample contributes five camera views. Detection is evaluated per im
 If you find this repository useful, please consider citing:
 
 ```bibtex
-@misc{ribeiro2026flownomaly,
+@article{ribeiro2026flownomaly,
   title={Flownomaly: Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection},
-  author={Bernardo Perrone Ribeiro and Erkut Akdag and Egor Bondarev},
-  year={2026},
-  eprint={2610.32964},
-  archivePrefix={arXiv},
-  primaryClass={cs.CV},
-  url={https://arxiv.org/abs/2610.32964},
+  author={Ribeiro, Bernardo Perrone and Akdag, Erkut and Bondarev, Egor},
+  journal={arXiv preprint arXiv:2610.32964},
+  year={2026}
 }
 ```
 
