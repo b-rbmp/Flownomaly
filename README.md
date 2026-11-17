@@ -1,6 +1,6 @@
 <h1 align="center">Flownomaly: Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection (WACV 2027)</h1>
 
-<p align="center"><a href="https://www.tue.nl/en/research/researchers/bernardo-perrone-de-menezes-bulcao-ribeiro">Bernardo Perrone Ribeiro</a> &middot; <a href="https://research.tue.nl/en/persons/erkut-akdag/">Erkut Akdag</a> &middot; <a href="https://www.tue.nl/en/research/researchers/egor-bondarau">Egor Bondarev</a></p>
+<p align="center"><a href="https://www.tue.nl/en/research/researchers/bernardo-perrone-de-menezes-bulcao-ribeiro">Bernardo Perrone Ribeiro</a> &middot; <a href="https://www.tue.nl/en/research/researchers/erkut-akdag">Erkut Akdag</a> &middot; <a href="https://www.tue.nl/en/research/researchers/egor-bondarau">Egor Bondarev</a></p>
 
 <p align="center">
   AIMS Group, Department of Electrical Engineering<br>
