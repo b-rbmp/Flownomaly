@@ -1,13 +1,13 @@
 <h1 align="center">Flownomaly: Single-Step Conditional-Mean Recovery for Few-Shot Anomaly Detection (WACV 2027)</h1>
 
-<p align="center">Bernardo Perrone Ribeiro &middot; Erkut Akdag &middot; Egor Bondarev</p>
+<p align="center"><a href="https://www.tue.nl/en/research/researchers/bernardo-perrone-de-menezes-bulcao-ribeiro">Bernardo Perrone Ribeiro</a> &middot; <a href="https://research.tue.nl/en/persons/erkut-akdag/">Erkut Akdag</a> &middot; <a href="https://www.tue.nl/en/research/researchers/egor-bondarau">Egor Bondarev</a></p>
 
 <p align="center">
   AIMS Group, Department of Electrical Engineering<br>
   Eindhoven University of Technology
 </p>
 
-<p align="center">Official implementation &middot; <a href="https://arxiv.org/pdf/2610.32964">Paper Link</a> &middot; <a href="https://b-rbmp.github.io/Flownomaly/">Project Page</a></p>
+<p align="center">Official implementation &middot; <a href="https://arxiv.org/pdf/2610.32964">Paper Link</a> &middot; <a href="https://b-rbmp.github.io/Flownomaly/">Project Page</a> &middot; <a href="https://huggingface.co/papers/2610.32964">Hugging Face</a></p>
 
 ---
 

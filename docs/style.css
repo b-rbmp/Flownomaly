@@ -61,6 +61,8 @@ h1 {
 .project-name { color: var(--accent); }
 .venue { margin: 0 0 10px; font-size: 24px; font-weight: 700; }
 .authors { margin: 0 0 8px; font-size: 19px; font-weight: 500; }
+.authors a { font-weight: 600; text-decoration: none; }
+.authors a:hover { text-decoration: underline; }
 .affiliation { margin: 0; color: var(--muted); }
 .mobile-break { display: none; }
 
