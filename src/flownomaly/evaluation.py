@@ -15,7 +15,7 @@ import torch.nn.functional as functional
 from .data import Sample, evaluation_order, index_dataset
 from .metrics import PixelMetrics, image_metrics
 from .protocol import PROTOCOL
-from .progress import RunLogger, get_reporter
+from .progress import DEFAULT_LOG_INTERVAL, RunLogger, get_reporter
 from .workflow import result_directory, run_logger
 
 
@@ -72,7 +72,14 @@ def _evaluate_category(
     labels: list[int] = []
     lower, upper = float("inf"), float("-inf")
     target_sizes = []
-    with reporter.stage("image_scores_and_bounds", len(samples), "images") as progress:
+    with reporter.stage(
+        "evaluation",
+        len(samples),
+        "images",
+        key="evaluation_scores",
+        display="Evaluation",
+        pass_name="1/2 image scores",
+    ) as progress:
         for raw_map, sample in zip(raw_maps, samples, strict=True):
             with Image.open(sample.image_path) as image:
                 target_size = image.size
@@ -84,25 +91,29 @@ def _evaluate_category(
             labels.append(0 if sample.anomaly_type == "good" else 1)
             progress.advance()
 
-    with reporter.stage("pixel_metric_initialization"):
-        pixel_metrics = PixelMetrics(lower, upper)
-    with reporter.stage(
-        "pixel_metric_accumulation", len(samples), "images"
-    ) as progress:
+        progress.set_work(len(samples), "images", key="evaluation_pixels")
+        progress.set(pass_name="2/2 pixel metrics")
+        with reporter.stage("pixel_metric_initialization"):
+            pixel_metrics = PixelMetrics(lower, upper)
         for raw_map, sample, target_size in zip(
             raw_maps, samples, target_sizes, strict=True
         ):
             full_map = localization_map(raw_map, target_size)
             pixel_metrics.add(full_map, _mask(sample, full_map.shape))
             progress.advance()
-    with reporter.stage("image_metrics"):
-        image_result = image_metrics(image_scores, labels)
-    with reporter.stage("pixel_metrics"):
-        pixel_result = pixel_metrics.result()
-    return {
-        "image": image_result,
-        "pixel": pixel_result,
-    }
+
+        progress.set_work(1, "steps", key="evaluation_finalize")
+        progress.set(pass_name="final metrics")
+        with reporter.stage("image_metrics"):
+            image_result = image_metrics(image_scores, labels)
+        with reporter.stage("pixel_metrics"):
+            pixel_result = pixel_metrics.result()
+        progress.set(
+            image_auroc=image_result["auroc"], pixel_auroc=pixel_result["auroc"]
+        )
+        result = {"image": image_result, "pixel": pixel_result}
+        reporter.emit("category_metrics", metrics=result)
+    return result
 
 
 def _mean_categories(categories: dict[str, dict]) -> dict:
@@ -130,53 +141,35 @@ def evaluate_main_results(
     shot: int,
     seeds: list[int],
     *,
-    log_interval: float = 10.0,
+    log_interval: float = DEFAULT_LOG_INTERVAL,
     log_dir: str | None = None,
     verbose: bool = False,
     quiet: bool = False,
 ) -> None:
-    with (
-        run_logger(
-            "evaluate",
-            dataset,
-            shot,
-            seeds,
-            output_root,
-            log_interval,
-            log_dir,
-            verbose,
-            quiet,
-        ) as reporter,
-        reporter.stage("run", len(seeds), "categories", quiet=True) as run,
-    ):
-        with reporter.stage("dataset_indexing", split="test") as progress:
+    with run_logger(
+        "evaluate",
+        dataset,
+        shot,
+        seeds,
+        output_root,
+        log_interval,
+        log_dir,
+        verbose,
+        quiet,
+    ) as reporter:
+        with reporter.stage("dataset_indexing", split="test"):
             indexed = index_dataset(dataset, data_root, "test")
             ordered = {
                 category: evaluation_order(samples)
                 for category, samples in indexed.items()
             }
-            progress.set(
-                categories=len(ordered), images=sum(map(len, ordered.values()))
-            )
         if not ordered:
             raise ValueError("dataset contains no evaluation categories")
-        run.total = len(seeds) * len(ordered)
         run_directory = result_directory(output_root, dataset, shot)
-        reporter.emit(
-            "run_plan", seeds=seeds, categories=len(ordered), output=run_directory
-        )
+        reporter.emit("run_plan", categories=len(ordered), output=run_directory)
         seed_results = []
-        for seed_index, seed in enumerate(seeds, 1):
-            with (
-                reporter.context(seed=seed),
-                reporter.stage(
-                    "seed",
-                    len(ordered),
-                    "categories",
-                    quiet=True,
-                    seed_index=f"{seed_index}/{len(seeds)}",
-                ) as seed_progress,
-            ):
+        for seed in seeds:
+            with reporter.context(seed=seed):
                 map_path = run_directory / "anomaly_maps" / f"seed={seed}.h5"
                 if not map_path.is_file():
                     raise FileNotFoundError(f"missing inference maps: {map_path}")
@@ -187,27 +180,15 @@ def evaluate_main_results(
                             "stored categories do not match the dataset index"
                         )
                     for category_index, category in enumerate(sorted(ordered), 1):
-                        with (
-                            reporter.context(category=category),
-                            reporter.stage(
-                                "category",
-                                key=f"category:{category}",
-                                category_index=f"{category_index}/{len(ordered)}",
-                            ) as category_progress,
+                        with reporter.context(
+                            category=category,
+                            category_index=f"{category_index}/{len(ordered)}",
                         ):
                             categories[category] = _evaluate_category(
                                 input_file[category],
                                 ordered[category],
                                 reporter=reporter,
                             )
-                            category_progress.set(
-                                metrics=categories[category],
-                                stage_times=reporter.phase_times(
-                                    category_progress.stage_id
-                                ),
-                            )
-                        seed_progress.advance()
-                        run.advance()
                 result = {
                     "categories": categories,
                     "mean": _mean_categories(categories),
@@ -243,7 +224,7 @@ def evaluate_main_results(
                         )
         reporter.emit(
             "evaluation_completed",
+            console=True,
             metrics=summary["mean"],
-            path=run_directory / "metrics_summary.json",
-            eta_s=0.0,
+            output=run_directory / "metrics_summary.json",
         )

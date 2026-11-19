@@ -1,11 +1,11 @@
-"""Throttled progress, structured run logs, and reusable stage timings."""
+"""Phase-level progress, structured metrics, and reusable ETA measurements."""
 
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -19,17 +19,18 @@ import traceback
 from uuid import uuid4
 
 
+DEFAULT_LOG_INTERVAL = 30.0
+
+
 def duration(seconds: float | None) -> str:
     if seconds is None or not math.isfinite(seconds):
         return "estimating"
-    seconds = max(0, math.ceil(seconds))
-    hours, remainder = divmod(seconds, 3600)
+    hours, remainder = divmod(max(0, math.ceil(seconds)), 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def validation_epochs(maximum: int, frequency: int) -> list[int]:
-    """Include the final epoch even when it falls outside the regular schedule."""
     return sorted(set(range(frequency, maximum + 1, frequency)) | {maximum})
 
 
@@ -42,16 +43,13 @@ def training_eta(
 ) -> float | None:
     if target <= epoch:
         return 0.0
-    remaining_checks = sum(epoch < check <= target for check in schedule)
-    if epoch_seconds is None or (remaining_checks and validation_seconds is None):
+    checks = sum(epoch < check <= target for check in schedule)
+    if epoch_seconds is None or (checks and validation_seconds is None):
         return None
-    return (target - epoch) * epoch_seconds + remaining_checks * (
-        validation_seconds or 0.0
-    )
+    return (target - epoch) * epoch_seconds + checks * (validation_seconds or 0.0)
 
 
 def _clean(value):
-    """Keep JSON strict, including diagnostic events containing NaN or infinity."""
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if isinstance(value, dict):
@@ -65,14 +63,13 @@ def _clean(value):
 
 def _value(value) -> str:
     if isinstance(value, float):
-        return f"{value:.6g}"
+        return f"{value:.5g}"
     if isinstance(value, (dict, list, tuple)):
-        return json.dumps(_clean(value), separators=(",", ":"))
+        return json.dumps(value, separators=(",", ":"))
     return str(value)
 
 
-def _console_line(now: datetime, record: dict) -> str:
-    """Keep the terminal compact; the text/JSONL files retain every field."""
+def _format_line(record: dict, verbose: bool = False) -> str:
     context = " ".join(
         str(record[key]) for key in ("command", "dataset") if key in record
     )
@@ -82,157 +79,109 @@ def _console_line(now: datetime, record: dict) -> str:
         context += f" s{record['seed']}"
     if "category" in record:
         context += f"/{record['category']}"
+    prefix = f"{record['timestamp'][11:19]} {record['level']} [{context.strip()}]"
+    if verbose:
+        details = " ".join(
+            f"{key}={_value(value)}"
+            for key, value in record.items()
+            if key not in {"timestamp", "run_id", "level", "traceback"}
+            and value is not None
+        )
+        return f"{prefix} {details}"
+
     event = record["event"]
-    stage = record.get("stage", "run")
-    title = (
-        stage
-        if event == "progress"
-        else (
-            f"{stage} {'start' if event == 'stage_started' else 'done' if event == 'stage_completed' else 'failed'}"
-            if event.startswith("stage_")
-            else event
+    phase = record.get("phase")
+    if phase:
+        suffix = (
+            " started"
+            if event == "stage_started"
+            else " completed"
+            if event == "stage_completed"
+            else ""
         )
-    )
+        parts = []
+        if record["stage"] == "training":
+            parts.append(
+                f"epoch={record.get('epoch', record['completed'])}/{record.get('maximum_epochs', record['total'])}"
+            )
+        elif record["unit"] != "steps":
+            parts.append(f"{record['completed']}/{record['total']} {record['unit']}")
+        for key, label in (
+            ("pass_name", "pass"),
+            ("train_loss", "loss"),
+            ("validation_loss", "val"),
+            ("best_validation_loss", "best"),
+            ("patience", "patience"),
+            ("best_epoch", "best_epoch"),
+            ("stop_reason", "stop"),
+            ("selected_time", "t"),
+            ("image_auroc", "image_AUROC"),
+            ("pixel_auroc", "pixel_AUROC"),
+        ):
+            if record.get(key) is not None:
+                parts.append(f"{label}={_value(record[key])}")
+        parts.append(f"elapsed={duration(record['elapsed_s'])}")
+        if event != "stage_completed":
+            label = (
+                "ETA(limit)"
+                if record["stage"] == "training"
+                else "ETA(pass)"
+                if record["stage"] == "evaluation"
+                and record.get("pass_name") != "final metrics"
+                else "ETA"
+            )
+            parts.append(f"{label}={duration(record['eta_s'])}")
+            if "early_stop_if_no_improvement_eta_s" in record:
+                conditional = (
+                    "epoch limit first"
+                    if record.get("early_stop_status") == "epoch_limit_first"
+                    else duration(record["early_stop_if_no_improvement_eta_s"])
+                )
+                parts.append(f"stop_if_unchanged={conditional}")
+        return f"{prefix} {phase}{suffix} | " + " ".join(parts)
+
     parts = []
-    if "completed" in record:
-        parts.append(f"{record['completed']}/{record['total']} {record['unit']}")
-    keys = {
-        "run_started": ("log_file", "log_interval_s"),
-        "run_plan": ("seeds", "categories", "fits", "workers"),
-        "epoch_metrics": (
-            "epoch",
-            "train_loss",
-            "learning_rate",
-            "skipped_amp_updates",
-        ),
-        "validation_result": (
-            "epoch",
-            "train_loss",
-            "validation_loss",
-            "best_validation_loss",
-            "best_epoch",
-            "selected",
-            "patience",
-            "patience_limit",
-            "decision",
-        ),
-        "training_completed": (
-            "epochs",
-            "final_train_loss",
-            "best_epoch",
-            "best_validation_loss",
-            "stop_reason",
-        ),
-        "calibration_completed": (
-            "selected_time",
-            "selected_score",
-            "runner_up",
-            "score_gap",
-            "boundary_selection",
-        ),
-        "calibration_view_completed": ("view", "total_views", "provisional_time"),
-        "run_failed": ("stage", "error"),
-        "run_interrupted": ("stage", "error"),
-    }.get(
-        event,
-        (
-            "epoch",
-            "category_index",
-            "seed_index",
-            "batch",
-            "train_loss",
-            "validation_loss",
-            "best_validation_loss",
-            "patience",
-            "next_validation_epoch",
-            "view",
-            "noise_pair",
-            "candidate_time",
-            "probe",
-            "rotations_enabled",
-            "retained_tokens",
-            "valid_tokens",
-            "stop_reason",
-            "best_epoch",
-            "operating_time",
-            "training_shape",
-            "validation_shape",
-            "training_mib",
-            "validation_mib",
-            "free_gib",
-            "path",
-            "error",
-            "skipped_amp_updates",
-            "gradient_norm",
-            "nonfinite_loss",
-            "nonfinite_gradient",
-            "metrics",
-        ),
-    )
-    aliases = {
-        "train_loss": "loss",
-        "validation_loss": "val",
-        "best_validation_loss": "best_val",
-        "candidate_time": "t",
-        "noise_pair": "pair",
-        "next_validation_epoch": "next_val",
-    }
-    for key in keys:
-        if event == "validation_result" and key in {"patience_limit", "selected"}:
-            continue
-        if record.get(key) is not None:
-            value = duration(record[key]) if key.endswith("_s") else _value(record[key])
-            if event == "validation_result" and key == "patience":
-                value = f"{value}/{record['patience_limit']} checks"
-            parts.append(f"{aliases.get(key, key)}={value}")
-    if event == "stage_started" and stage == "training":
-        parts.extend(
-            f"{key}={_value(record[key])}"
-            for key in ("validation_frequency", "patience_limit", "minimum_delta")
-            if key in record
-        )
+    if event == "evaluation_completed":
+        for label, level, metric in (
+            ("image_AUROC", "image", "auroc"),
+            ("pixel_AUROC", "pixel", "auroc"),
+            ("pixel_AUPRO", "pixel", "aupro"),
+        ):
+            value = record["metrics"][level][metric]
+            parts.append(f"{label}={100 * value['mean']:.1f}±{100 * value['std']:.1f}%")
+    for key in (
+        "seeds",
+        "categories",
+        "output",
+        "log_file",
+        "metrics",
+        "stage",
+        "error",
+        "nonfinite_loss",
+        "nonfinite_gradient",
+        "skipped_amp_updates",
+    ):
+        if record.get(key) is not None and not (
+            event == "evaluation_completed" and key == "metrics"
+        ):
+            parts.append(f"{key}={_value(record[key])}")
     if event == "run_started":
         parts.append(f"device={record.get('profile', {}).get('device', 'unknown')}")
     if "elapsed_s" in record:
         parts.append(f"elapsed={duration(record['elapsed_s'])}")
-    if "eta_s" in record:
-        label = (
-            "ETA(limit)"
-            if record.get("eta_kind") == "epoch_limit" or stage == "training"
-            else "ETA"
-        )
-        parts.append(f"{label}={duration(record['eta_s'])}")
-        if record["eta_s"] is not None:
-            parts.append(
-                f"finish={(now + timedelta(seconds=record['eta_s'])).strftime('%H:%M:%S')}"
-            )
-    for label, key in (
-        ("ETA(limit)", "limit_eta_s"),
-        ("ETA(no improvement)", "early_stop_if_no_improvement_eta_s"),
-        ("run ETA", "run_eta_s"),
-    ):
-        if key in record:
-            value = (
-                "epoch limit first"
-                if key == "early_stop_if_no_improvement_eta_s"
-                and record.get("early_stop_status") == "epoch_limit_first"
-                else duration(record[key])
-            )
-            parts.append(f"{label}={value}")
-    return (
-        f"{now:%H:%M:%S} {record['level']} [{context.strip()}] {title} | "
-        + " ".join(parts)
+    return f"{prefix} {event.replace('_', ' ')}" + (
+        " | " + " ".join(parts) if parts else ""
     )
 
 
 class RunLogger:
-    """One heartbeat per run; complete metrics on disk, compact output on stderr."""
+    """One reporting schedule for visible phases; full metrics stay in JSONL."""
 
     def __init__(
         self,
         directory: str | Path | None = None,
         *,
-        interval: float = 10.0,
+        interval: float = DEFAULT_LOG_INTERVAL,
         verbose: bool = False,
         quiet: bool = False,
         context: dict | None = None,
@@ -241,9 +190,7 @@ class RunLogger:
     ):
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("log interval should be a positive finite number")
-        self.interval = interval
-        self.verbose = verbose
-        self.quiet = quiet
+        self.interval, self.verbose, self.quiet = interval, verbose, quiet
         self.stream = sys.stderr if stream is None else stream
         self.context_fields = dict(context or {})
         self.profile = {"machine": platform.machine(), **(profile or {})}
@@ -254,12 +201,11 @@ class RunLogger:
         self._stages: list[Stage] = []
         self._history: dict = {}
         self._observations: dict = {}
-        self._timings: list[dict] = []
         self._failure_context: dict | None = None
+        self._last_report = float("-inf")
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._session = False
-        self._last_console = float("-inf")
         self._text_file = self._json_file = None
         self._history_path: Path | None = None
         self.started = time.monotonic()
@@ -269,8 +215,10 @@ class RunLogger:
         if directory is not None:
             directory = Path(directory).expanduser().resolve()
             directory.mkdir(parents=True, exist_ok=True)
-            prefix = self.context_fields.get("command", "run")
-            self.log_path = directory / f"{prefix}-{self.run_id}.log"
+            self.log_path = (
+                directory
+                / f"{self.context_fields.get('command', 'run')}-{self.run_id}.log"
+            )
             self.jsonl_path = self.log_path.with_suffix(".jsonl")
             self._text_file = self.log_path.open("w", encoding="utf-8")
             self._json_file = self.jsonl_path.open("w", encoding="utf-8")
@@ -278,25 +226,32 @@ class RunLogger:
             self._history = self._read_history()
 
     def _read_history(self) -> dict:
+        if self._history_path is None:
+            return {}
         try:
             value = json.loads(self._history_path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError):
             return {}
+        if not isinstance(value, dict):
+            return {}
+        # Cached estimates are optional; malformed entries should never fail a run.
+        history = {}
+        for key, entry in value.items():
+            rate = entry.get("seconds_per_unit") if isinstance(entry, dict) else None
+            if type(rate) in (int, float) and math.isfinite(rate) and rate > 0:
+                history[key] = {"seconds_per_unit": rate}
+        return history
 
     def seconds_per_unit(self, key: str, unit: str) -> float | None:
         entry = self._history.get(f"{self._profile_key}:{key}:{unit}", {})
-        value = entry.get("seconds_per_unit") if isinstance(entry, dict) else None
-        return (
-            value
-            if isinstance(value, (int, float)) and math.isfinite(value) and value > 0
-            else None
-        )
+        return entry.get("seconds_per_unit")
 
     def _remember(self, stage: Stage) -> None:
-        if stage.completed <= 0 or stage.elapsed <= 0:
+        if stage.completed <= 0:
             return
-        observed = stage.elapsed / stage.completed
+        observed = (time.monotonic() - stage.work_started) / stage.completed
+        if observed <= 0:
+            return
         for stage_key in {stage.key, stage.name}:
             key = f"{self._profile_key}:{stage_key}:{stage.unit}"
             previous = self.seconds_per_unit(stage_key, stage.unit)
@@ -306,14 +261,6 @@ class RunLogger:
                 else 0.7 * previous + 0.3 * observed
             }
             self._history[key] = self._observations[key] = entry
-
-    def phase_times(self, parent_id: str) -> dict[str, float]:
-        with self._lock:
-            return {
-                item["stage"]: round(item["elapsed_s"], 3)
-                for item in self._timings
-                if item["parent_id"] == parent_id
-            }
 
     def _save_history(self) -> None:
         if self._history_path is None:
@@ -328,7 +275,7 @@ class RunLogger:
                 temporary = Path(output.name)
                 json.dump(history, output, allow_nan=False, sort_keys=True)
             temporary.replace(self._history_path)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             self.emit("timing_cache_unavailable", level="WARNING", error=str(error))
         finally:
             if temporary is not None:
@@ -337,38 +284,51 @@ class RunLogger:
     def __enter__(self):
         self._session = True
         self._token = _ACTIVE.set(self)
-        self.emit(
-            "run_started",
-            profile=self.profile,
-            log_file=getattr(self, "log_path", None),
-            metrics_file=getattr(self, "jsonl_path", None),
-            log_interval_s=self.interval,
-        )
+        try:
+            self.emit(
+                "run_started",
+                console=True,
+                profile=self.profile,
+                log_file=getattr(self, "log_path", None),
+            )
+        except BaseException:
+            self._close()
+            raise
         return self
 
-    def __exit__(self, error_type, error, tb):
+    def _close(self) -> None:
         self._session = False
-        self._stop_heartbeat()
-        if error is not None:
-            self.emit(
-                "run_interrupted"
-                if isinstance(error, KeyboardInterrupt)
-                else "run_failed",
-                level="ERROR",
-                error=str(error),
-                traceback="".join(traceback.format_exception(error_type, error, tb)),
-                elapsed_s=time.monotonic() - self.started,
-                **(self._failure_context or {}),
-            )
-        else:
-            self.emit(
-                "run_completed", elapsed_s=time.monotonic() - self.started, eta_s=0.0
-            )
-        self._save_history()
         _ACTIVE.reset(self._token)
         for output in (self._text_file, self._json_file):
             if output is not None:
                 output.close()
+
+    def __exit__(self, error_type, error, tb):
+        self._session = False
+        self._stop_heartbeat()
+        try:
+            if error is not None:
+                self.emit(
+                    "run_interrupted"
+                    if isinstance(error, KeyboardInterrupt)
+                    else "run_failed",
+                    level="ERROR",
+                    error=str(error),
+                    traceback="".join(
+                        traceback.format_exception(error_type, error, tb)
+                    ),
+                    elapsed_s=time.monotonic() - self.started,
+                    **(self._failure_context or {}),
+                )
+            else:
+                self.emit(
+                    "run_completed",
+                    console=True,
+                    elapsed_s=time.monotonic() - self.started,
+                )
+            self._save_history()
+        finally:
+            self._close()
 
     @contextmanager
     def context(self, **fields):
@@ -384,12 +344,17 @@ class RunLogger:
     def stage(self, name: str, total: int = 1, unit: str = "steps", **kwargs) -> Stage:
         return Stage(self, name, total, unit, **kwargs)
 
-    def emit(self, event: str, *, level: str = "INFO", console=True, **fields) -> None:
+    def emit(
+        self, event: str, *, level: str = "INFO", console: bool = False, **fields
+    ) -> None:
+        if level == "DEBUG" and not self.verbose:
+            return
         with self._lock:
-            now = datetime.now().astimezone()
             record = _clean(
                 {
-                    "timestamp": now.isoformat(timespec="seconds"),
+                    "timestamp": datetime.now()
+                    .astimezone()
+                    .isoformat(timespec="seconds"),
                     "run_id": self.run_id,
                     "level": level,
                     **self.context_fields,
@@ -399,73 +364,53 @@ class RunLogger:
             )
             if self._stages:
                 record.setdefault("stage", self._stages[-1].name)
-            labels = " ".join(
-                f"{key}={record[key]}"
-                for key in ("command", "dataset", "shot", "seed", "category")
-                if key in record
-            )
-            parts = []
-            for key, value in fields.items():
-                if key in {"traceback", "profile", "stage_id"}:
-                    continue
-                if (
-                    key.endswith("_s")
-                    and not key.endswith("_per_s")
-                    and (value is None or isinstance(value, (int, float)))
-                ):
-                    parts.append(f"{key[:-2]}={duration(value)}")
-                elif value is not None:
-                    parts.append(f"{key}={_value(value)}")
-            if "eta_s" in fields and fields["eta_s"] is not None:
-                parts.append(
-                    f"finish={(now + timedelta(seconds=max(0, fields['eta_s']))).strftime('%H:%M:%S')}"
-                )
-            line = f"{now:%H:%M:%S} {level} [{labels}] {event}"
-            if parts:
-                line += " | " + " ".join(parts)
-            if self._text_file is not None:
-                self._text_file.write(line + "\n")
-                if fields.get("traceback"):
-                    self._text_file.write(fields["traceback"])
-                self._text_file.flush()
+            if self._json_file is not None:
                 self._json_file.write(json.dumps(record, allow_nan=False) + "\n")
                 self._json_file.flush()
-            due = time.monotonic() - self._last_console >= self.interval
-            visible = (
-                level in {"WARNING", "ERROR"}
-                or (not self.quiet and (level != "DEBUG" or self.verbose))
-            ) and (console is True or (console == "periodic" and due))
-            if visible:
-                self.stream.write(
-                    (line if self.verbose else _console_line(now, record)) + "\n"
-                )
+            if not (console or self.verbose or level in {"WARNING", "ERROR"}):
+                return
+            line = _format_line(record, self.verbose)
+            if self._text_file is not None:
+                self._text_file.write(line + "\n")
+                if record.get("traceback"):
+                    self._text_file.write(record["traceback"])
+                self._text_file.flush()
+            if not self.quiet or level in {"WARNING", "ERROR"}:
+                self.stream.write(line + "\n")
                 self.stream.flush()
-                self._last_console = time.monotonic()
+            self._last_report = time.monotonic()
+
+    def _report_progress(self) -> None:
+        with self._lock:
+            if time.monotonic() - self._last_report < self.interval:
+                return
+            phase = next(
+                (
+                    stage
+                    for stage in reversed(self._stages)
+                    if stage.display is not None
+                    and (not stage.transient or stage.elapsed >= self.interval)
+                ),
+                None,
+            )
+            if phase is not None:
+                phase.shown = True
+                self.emit("progress", console=True, **phase.snapshot())
 
     def _start_heartbeat(self) -> None:
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            self._stop = threading.Event()
-            stop = self._stop
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop = threading.Event()
+        stop = self._stop
 
-            def heartbeat():
-                while not stop.wait(self.interval):
-                    with self._lock:
-                        if not self._stages:
-                            continue
-                        active = self._stages[-1]
-                        fields = active.snapshot()
-                        for parent in self._stages[:-1]:
-                            if parent.name in {"run", "seed", "category", "training"}:
-                                fields[f"{parent.name}_eta_s"] = parent.remaining
-                                fields = {**parent.detail_fields(), **fields}
-                        self.emit("progress", console="periodic", **fields)
+        def heartbeat():
+            while not stop.wait(min(self.interval, 1.0)):
+                self._report_progress()
 
-            self._thread = threading.Thread(
-                target=heartbeat, name="flownomaly-progress", daemon=True
-            )
-            self._thread.start()
+        self._thread = threading.Thread(
+            target=heartbeat, name="flownomaly-progress", daemon=True
+        )
+        self._thread.start()
 
     def _stop_heartbeat(self) -> None:
         self._stop.set()
@@ -475,6 +420,8 @@ class RunLogger:
 
 
 class Stage:
+    """A timed operation; only stages with a display label are public phases."""
+
     def __init__(
         self,
         reporter: RunLogger,
@@ -483,26 +430,17 @@ class Stage:
         unit: str,
         *,
         key: str | None = None,
-        quiet: bool = False,
+        display: str | None = None,
+        transient: bool = False,
         **fields,
     ):
-        if total < 0:
-            raise ValueError("stage total should be non-negative")
-        self.reporter, self.name, self.total, self.unit = reporter, name, total, unit
-        self.key, self.quiet = key or name, quiet
+        self.reporter, self.name = reporter, name
+        self.display, self.transient, self.shown = display, transient, False
         self.fields = fields
-        self._field_updated: dict[str, float] = {}
-        self._parent_id: str | None = None
-        self.completed = 0
-        self.started = self._last_advance = time.monotonic()
-        self._rate = reporter.seconds_per_unit(
-            self.key, unit
-        ) or reporter.seconds_per_unit(name, unit)
-        self._samples = 0
-        self._eta_override = False
-        self._eta = None
-        self._eta_updated = self.started
-        self.stage_id = uuid4().hex[:8]
+        self._countdowns: dict[str, float] = {}
+        self.started = time.monotonic()
+        self._finished = False
+        self.set_work(total, unit, key=key or name)
 
     @property
     def elapsed(self) -> float:
@@ -510,69 +448,78 @@ class Stage:
 
     @property
     def remaining(self) -> float | None:
-        if self.completed >= self.total:
-            if (
-                self.reporter._stages
-                and self in self.reporter._stages
-                and self.reporter._stages[-1] is not self
-            ):
-                return self.reporter._stages[-1].remaining
+        if self._finished:
             return 0.0
+        if self.completed >= self.total:
+            children = self.reporter._stages
+            return (
+                children[-1].remaining
+                if self in children and children[-1] is not self
+                else None
+            )
         if self._eta_override:
-            estimate = self._eta
-            since = time.monotonic() - self._eta_updated
+            estimate, updated = self._eta, self._eta_updated
         else:
             estimate = (
                 None
                 if self._rate is None
                 else (self.total - self.completed) * self._rate
             )
-            since = time.monotonic() - self._last_advance
-        # An overrun is unknown, rather than a misleading zero before completion.
-        return estimate - since if estimate is not None and estimate > since else None
+            updated = self._last_advance
+        remaining = (
+            None if estimate is None else estimate - (time.monotonic() - updated)
+        )
+        return remaining if remaining is not None and remaining > 0 else None
+
+    def set_work(self, total: int, unit: str, *, key: str | None = None) -> None:
+        if total < 0:
+            raise ValueError("stage total should be non-negative")
+        with self.reporter._lock:
+            if getattr(self, "completed", 0) > 0:
+                self.reporter._remember(self)
+            self.total, self.unit, self.completed = total, unit, 0
+            self.key = key or self.name
+            self.work_started = self._last_advance = time.monotonic()
+            self._rate = self.reporter.seconds_per_unit(
+                self.key, unit
+            ) or self.reporter.seconds_per_unit(self.name, unit)
+            self._samples = 0
+            self._eta_override, self._eta = False, None
+            self._eta_updated = self.work_started
 
     def snapshot(self) -> dict:
-        remaining = self.remaining
+        fields = self.fields.copy()
+        for key, updated in self._countdowns.items():
+            value = fields[key]
+            if value is not None:
+                remaining = value - (time.monotonic() - updated)
+                fields[key] = (
+                    remaining if remaining > 0 else 0.0 if value == 0 else None
+                )
         return {
             "stage": self.name,
-            "stage_id": self.stage_id,
+            "phase": self.display,
             "completed": self.completed,
             "total": self.total,
             "unit": self.unit,
             "elapsed_s": self.elapsed,
-            "eta_s": remaining,
-            "rate_per_s": None if not self._rate else 1.0 / self._rate,
-            "eta_source": "projection"
-            if self._eta_override
-            else "measured"
-            if self._samples
-            else "history"
-            if self._rate
-            else "estimating",
-            **self.detail_fields(),
+            "eta_s": self.remaining,
+            **fields,
         }
-
-    def detail_fields(self) -> dict:
-        fields = self.fields.copy()
-        for key, updated in self._field_updated.items():
-            if fields[key] is not None:
-                remaining = fields[key] - (time.monotonic() - updated)
-                fields[key] = (
-                    remaining if remaining > 0 else 0.0 if fields[key] == 0 else None
-                )
-        return fields
 
     def __enter__(self):
         with self.reporter._lock:
-            self.started = self._last_advance = time.monotonic()
-            self._parent_id = (
-                self.reporter._stages[-1].stage_id if self.reporter._stages else None
-            )
+            self.started = self.work_started = self._last_advance = time.monotonic()
             self.reporter._stages.append(self)
+            self.shown = self.display is not None and not self.transient
             self.reporter.emit(
-                "stage_started", console=not self.quiet, **self.snapshot()
+                "stage_started",
+                level="INFO" if self.display else "DEBUG",
+                console=self.shown,
+                **self.snapshot(),
             )
-            self.reporter._start_heartbeat()
+            if self.display is not None:
+                self.reporter._start_heartbeat()
         return self
 
     def advance(self, count: int = 1, **fields) -> None:
@@ -580,7 +527,7 @@ class Stage:
             now = time.monotonic()
             if count > 0:
                 observed = (now - self._last_advance) / count
-                # Replace the first (warm-up) sample on the second update.
+                # Discard the first warm-up sample before smoothing later timings.
                 self._rate = (
                     observed
                     if self._samples <= 1
@@ -595,8 +542,8 @@ class Stage:
         with self.reporter._lock:
             self.fields.update(fields)
             for key in fields:
-                if key.endswith("eta_s"):
-                    self._field_updated[key] = time.monotonic()
+                if key.endswith("_eta_s"):
+                    self._countdowns[key] = time.monotonic()
 
     def eta(self, seconds: float | None) -> None:
         with self.reporter._lock:
@@ -616,17 +563,12 @@ class Stage:
             if error is None:
                 if self.completed < self.total:
                     self.advance(self.total - self.completed)
+                self._finished = True
                 self.reporter._remember(self)
-                self.reporter._timings.append(
-                    {
-                        "stage": self.name,
-                        "parent_id": self._parent_id,
-                        "elapsed_s": self.elapsed,
-                    }
-                )
             self.reporter.emit(
                 "stage_completed" if error is None else "stage_failed",
-                console=not self.quiet if error is None else False,
+                level="INFO" if self.display else "DEBUG",
+                console=self.shown and error is None,
                 **self.snapshot(),
                 **({"error": str(error)} if error is not None else {}),
             )
@@ -659,17 +601,19 @@ def add_logging_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--log-interval",
         type=_positive_interval,
-        default=10.0,
-        help="Seconds between progress/metric updates (default: 10).",
+        default=DEFAULT_LOG_INTERVAL,
+        help="Seconds between phase progress updates (default: 30).",
     )
     parser.add_argument("--log-dir", help="Log directory (default: <run output>/logs).")
     parser.add_argument(
-        "--verbose", action="store_true", help="Print detailed diagnostic events."
+        "--verbose",
+        action="store_true",
+        help="Include internal operations and diagnostic details.",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Only print warnings/errors; keep full logs on disk.",
+        help="Only print warnings/errors; keep logs on disk.",
     )
 
 

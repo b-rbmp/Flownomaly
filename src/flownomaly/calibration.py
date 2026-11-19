@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import math
 
 import torch
 
 from .protocol import PROTOCOL
-from .progress import RunLogger, get_reporter
+from .progress import RunLogger, Stage, get_reporter
 from .rotation import image_key_hash
 
 
@@ -74,6 +75,7 @@ def select_operating_time(
     device: torch.device,
     *,
     reporter: RunLogger | None = None,
+    progress: Stage | None = None,
 ) -> float:
     """Return the JGN-selected operating time for one fitted category."""
     reporter = reporter if reporter is not None else get_reporter()
@@ -98,16 +100,22 @@ def select_operating_time(
         * PROTOCOL.jgn_noise_pairs
         * PROTOCOL.jgn_probes
     )
-    with reporter.stage(
-        "calibration_search",
-        total_jvps,
-        "JVPs",
-        views=len(calibration_views),
-        candidates=len(candidate_values),
-        noise_pairs=PROTOCOL.jgn_noise_pairs,
-        probes=PROTOCOL.jgn_probes,
-    ) as progress:
-        for view_index, view in enumerate(calibration_views, 1):
+    owns_progress = progress is None
+    context = (
+        reporter.stage(
+            "calibration",
+            total_jvps,
+            "JVPs",
+            key="calibration_search",
+            display="Calibration",
+        )
+        if owns_progress
+        else nullcontext(progress)
+    )
+    with context as progress:
+        if not owns_progress:
+            progress.set_work(total_jvps, "JVPs", key="calibration_search")
+        for view in calibration_views:
             features = view["features"].detach().cpu().float().contiguous()
             token_count, feature_dimension = features.shape
             top_count = max(1, int(token_count * PROTOCOL.jgn_token_fraction))
@@ -174,14 +182,7 @@ def select_operating_time(
                                 .sum()
                                 .item()
                             )
-                            progress.advance(
-                                view=f"{view_index}/{len(calibration_views)}",
-                                view_id=view["view_id"],
-                                noise_pair=f"{pair_index + 1}/{PROTOCOL.jgn_noise_pairs}",
-                                candidate_time=candidate,
-                                chunk=start // PROTOCOL.jgn_batch_size + 1,
-                                probe=f"{probe_index + 1}/{PROTOCOL.jgn_probes}",
-                            )
+                            progress.advance()
                     gains = [value / token_count for value in probe_sums]
                     gain = sum(gains) / PROTOCOL.jgn_probes
                     scores = torch.cat(residual_scores)
@@ -191,11 +192,18 @@ def select_operating_time(
                         .item()
                     )
                     ratio = gain / (normal_floor + PROTOCOL.jgn_epsilon)
+                    if not all(
+                        math.isfinite(value) for value in (gain, normal_floor, ratio)
+                    ):
+                        raise FloatingPointError(
+                            f"non-finite JGN score for category={category}, "
+                            f"view={view['view_id']}, time={candidate}: "
+                            f"gain={gain}, normal_floor={normal_floor}, score={ratio}"
+                        )
                     pair_ratios[candidate].append(ratio)
                     reporter.emit(
                         "calibration_candidate",
                         level="DEBUG",
-                        console=reporter.verbose,
                         view_id=view["view_id"],
                         noise_pair=pair_index + 1,
                         candidate_time=candidate,
@@ -205,60 +213,22 @@ def select_operating_time(
                         valid_tokens=token_count,
                         top_tokens=top_count,
                     )
-                    if not math.isfinite(ratio):
-                        reporter.emit(
-                            "nonfinite_calibration_score",
-                            level="WARNING",
-                            console="periodic",
-                            view_id=view["view_id"],
-                            candidate_time=candidate,
-                            gain=gain,
-                            normal_floor=normal_floor,
-                            score=ratio,
-                        )
-
             for candidate in candidate_values:
                 view_scores[candidate].append(_median(pair_ratios[candidate]))
-            provisional = {
-                candidate: _median(scores) for candidate, scores in view_scores.items()
-            }
-            leader = max(
-                provisional, key=lambda candidate: (provisional[candidate], -candidate)
-            )
-            progress.set(
-                provisional_time=leader,
-                provisional_score=provisional[leader],
-                completed_views=view_index,
-                scores_status="provisional",
-            )
-            reporter.emit(
-                "calibration_view_completed",
-                console="periodic",
-                view=view_index,
-                total_views=len(calibration_views),
-                provisional_time=leader,
-                provisional_scores=provisional,
-                scores_status="provisional",
-                eta_s=progress.remaining,
-            )
 
-    aggregate = {
-        candidate: _median(view_scores[candidate]) for candidate in candidate_values
-    }
-    best = max(aggregate.values())
-    selected = min(candidate for candidate, score in aggregate.items() if score == best)
-    ranked = sorted(aggregate, key=lambda candidate: (-aggregate[candidate], candidate))
-    runner_up = ranked[1] if len(ranked) > 1 else None
-    reporter.emit(
-        "calibration_completed",
-        selected_time=selected,
-        selected_score=best,
-        runner_up=runner_up,
-        score_gap=None if runner_up is None else best - aggregate[runner_up],
-        boundary_selection=selected in (min(candidate_values), max(candidate_values)),
-        candidate_scores=aggregate,
-        total_jvps=total_jvps,
-        elapsed_s=progress.elapsed,
-        eta_s=0.0,
-    )
-    return selected
+        aggregate = {
+            candidate: _median(view_scores[candidate]) for candidate in candidate_values
+        }
+        best = max(aggregate.values())
+        selected = min(
+            candidate for candidate, score in aggregate.items() if score == best
+        )
+        progress.set(selected_time=selected, selected_score=best)
+        reporter.emit(
+            "calibration_scores",
+            candidate_scores=aggregate,
+            selected_time=selected,
+            selected_score=best,
+            total_jvps=total_jvps,
+        )
+        return selected

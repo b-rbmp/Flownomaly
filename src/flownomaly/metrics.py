@@ -81,7 +81,7 @@ def image_metrics(scores: list[float], labels: list[int]) -> dict[str, float]:
 class PixelMetrics:
     def __init__(self, lower: float, upper: float):
         if not torch.cuda.is_available():
-            raise RuntimeError("published ADEval evaluation requires CUDA")
+            raise RuntimeError("Pixel-level evaluation requires a CUDA GPU.")
         self.bounds = _padded_bounds(lower, upper)
         self.accumulator = EvalAccumulatorCuda(
             self.bounds[0],
