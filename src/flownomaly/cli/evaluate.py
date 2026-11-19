@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from flownomaly.evaluation import evaluate_main_results
+from flownomaly.progress import add_logging_arguments, logging_options
 from flownomaly.protocol import DATASETS, SEEDS, SHOTS, validate_main_result
 
 
@@ -15,6 +16,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--seeds", nargs="+", type=int, default=list(SEEDS), choices=SEEDS
     )
+    add_logging_arguments(parser)
     return parser.parse_args(argv)
 
 
@@ -22,7 +24,12 @@ def main(argv=None):
     args = parse_args(argv)
     validate_main_result(args.dataset, args.shot, args.seeds)
     evaluate_main_results(
-        args.dataset, args.data_root, args.output_root, args.shot, args.seeds
+        args.dataset,
+        args.data_root,
+        args.output_root,
+        args.shot,
+        args.seeds,
+        **logging_options(args),
     )
 
 
