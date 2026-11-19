@@ -5,26 +5,29 @@ from __future__ import annotations
 import copy
 import math
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
 from torch import nn
 from torchvision import transforms
 from torchvision.transforms import functional as TF
-from tqdm import trange
 
 from .calibration import select_operating_time
 from .data import Sample
 from .network import VelocityNetwork
 from .protocol import PROTOCOL
+from .progress import RunLogger, Stage, get_reporter, training_eta, validation_epochs
 from .rotation import rotation_view
 
 
 class Flownomaly:
-    def __init__(self, device: str = "cuda"):
+    def __init__(self, device: str = "cuda", *, reporter: RunLogger | None = None):
         if device != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("The reproduction path requires a CUDA GPU.")
         self.device = torch.device(device)
+        self.reporter = reporter if reporter is not None else get_reporter()
+        self.fit_summary: dict = {}
         self.encoder: nn.Module | None = None
         self.velocity_model: VelocityNetwork | None = None
         self.layer_statistics: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -54,6 +57,15 @@ class Flownomaly:
     def load_encoder(self) -> None:
         if self.encoder is not None:
             return
+        with self.reporter.stage(
+            "encoder_loading",
+            display="Loading encoder",
+            transient=True,
+            backbone=PROTOCOL.backbone,
+        ):
+            self._load_encoder()
+
+    def _load_encoder(self) -> None:
         encoder = (
             torch.hub.load(
                 "facebookresearch/dinov2:main",
@@ -133,6 +145,7 @@ class Flownomaly:
         seed: int,
         offset: int,
         enabled: bool,
+        progress: Stage,
     ) -> dict[int, list[torch.Tensor]]:
         per_layer = {layer: [] for layer in PROTOCOL.target_layers}
         maximum_angle = PROTOCOL.maximum_rotation_angle if enabled else 0.0
@@ -169,10 +182,11 @@ class Flownomaly:
                 )
                 for layer, value in zip(PROTOCOL.target_layers, raw, strict=True):
                     per_layer[layer].append(value[masks.to(value.device)])
+                progress.advance(stop - start)
         return per_layer
 
     def _identity_pool(
-        self, support_images: torch.Tensor
+        self, support_images: torch.Tensor, progress: Stage
     ) -> dict[int, list[torch.Tensor]]:
         per_layer = {layer: [] for layer in PROTOCOL.target_layers}
         for start in range(0, len(support_images), PROTOCOL.extraction_batch_size):
@@ -181,9 +195,12 @@ class Flownomaly:
             )
             for layer, value in zip(PROTOCOL.target_layers, raw, strict=True):
                 per_layer[layer].append(value.reshape(-1, value.shape[-1]))
+            progress.advance(len(raw[0]))
         return per_layer
 
-    def _fixed_validation_loss(self, validation_bank: torch.Tensor) -> float:
+    def _fixed_validation_loss(
+        self, validation_bank: torch.Tensor, *, epoch: int | None = None
+    ) -> float:
         if self.velocity_model is None:
             raise RuntimeError("velocity model is not initialized")
         was_training = self.velocity_model.training
@@ -192,28 +209,42 @@ class Flownomaly:
         generator.manual_seed(PROTOCOL.validation_seed)
         total = 0.0
         count = 0
-        with torch.no_grad():
-            for start in range(0, len(validation_bank), PROTOCOL.flow_batch_size):
-                target = validation_bank[
-                    start : start + PROTOCOL.flow_batch_size
-                ].float()
-                noise = torch.randn(
-                    target.shape, generator=generator, dtype=torch.float32
-                ).to(self.device)
-                time = torch.rand(
-                    (len(target), 1), generator=generator, dtype=torch.float32
-                ).to(self.device)
-                state = time * target + (1.0 - time) * noise
-                with torch.amp.autocast(device_type="cuda", enabled=True):
-                    prediction = self.velocity_model(state, time)
-                loss = torch.nn.functional.mse_loss(
-                    prediction.float(), (target - noise).float()
-                )
-                total += float(loss.item()) * len(target)
-                count += len(target)
-        if was_training:
-            self.velocity_model.train()
-        return total / count
+        try:
+            with (
+                self.reporter.stage(
+                    "validation",
+                    len(validation_bank),
+                    "tokens",
+                    display="Validation",
+                    transient=True,
+                    epoch=epoch,
+                    key=f"validation:{len(validation_bank)}",
+                    batches=math.ceil(len(validation_bank) / PROTOCOL.flow_batch_size),
+                ) as progress,
+                torch.no_grad(),
+            ):
+                for start in range(0, len(validation_bank), PROTOCOL.flow_batch_size):
+                    target = validation_bank[
+                        start : start + PROTOCOL.flow_batch_size
+                    ].float()
+                    noise = torch.randn(
+                        target.shape, generator=generator, dtype=torch.float32
+                    ).to(self.device)
+                    time = torch.rand(
+                        (len(target), 1), generator=generator, dtype=torch.float32
+                    ).to(self.device)
+                    state = time * target + (1.0 - time) * noise
+                    with torch.amp.autocast(device_type="cuda", enabled=True):
+                        prediction = self.velocity_model(state, time)
+                    loss = torch.nn.functional.mse_loss(
+                        prediction.float(), (target - noise).float()
+                    )
+                    total += float(loss.item()) * len(target)
+                    count += len(target)
+                    progress.advance(len(target), validation_loss=total / count)
+            return total / count
+        finally:
+            self.velocity_model.train(was_training)
 
     def fit(
         self,
@@ -222,10 +253,17 @@ class Flownomaly:
         dataset: str,
         category: str,
     ) -> None:
-        if self.encoder is None:
-            raise RuntimeError("load_encoder() must be called first")
-        rotations_enabled = self._rotations_enabled(dataset, category)
-        training = self._identity_pool(support_images)
+        with self.reporter.context(dataset=dataset, category=category):
+            self._fit(support_images, support_samples, dataset, category)
+
+    def _feature_banks(
+        self,
+        support_images: torch.Tensor,
+        support_samples: list[Sample],
+        rotations_enabled: bool,
+        progress: Stage,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        training = self._identity_pool(support_images, progress)
         if rotations_enabled:
             rotated_training = self._rotation_pool(
                 support_images,
@@ -235,6 +273,7 @@ class Flownomaly:
                 PROTOCOL.training_rotation_seed,
                 0,
                 True,
+                progress,
             )
             for layer in PROTOCOL.target_layers:
                 training[layer].extend(rotated_training[layer])
@@ -247,24 +286,122 @@ class Flownomaly:
             PROTOCOL.validation_seed,
             PROTOCOL.validation_rotation_offset,
             rotations_enabled,
+            progress,
         )
-
-        for layer in PROTOCOL.target_layers:
-            values = torch.cat(training[layer], dim=0)
-            self.layer_statistics[layer] = (
-                values.mean(dim=0, keepdim=True),
-                values.std(dim=0, keepdim=True),
+        with self.reporter.stage(
+            "feature_statistics", len(PROTOCOL.target_layers), "layers"
+        ) as statistics:
+            for layer in PROTOCOL.target_layers:
+                values = torch.cat(training[layer], dim=0)
+                self.layer_statistics[layer] = (
+                    values.mean(dim=0, keepdim=True),
+                    values.std(dim=0, keepdim=True),
+                )
+                del values
+                statistics.advance()
+        with self.reporter.stage("normalize_training_bank"):
+            training_bank = self._normalize_and_average(
+                [torch.cat(training[layer], dim=0) for layer in PROTOCOL.target_layers]
             )
-            del values
-        training_bank = self._normalize_and_average(
-            [torch.cat(training[layer], dim=0) for layer in PROTOCOL.target_layers]
+        with self.reporter.stage("normalize_validation_bank"):
+            validation_bank = self._normalize_and_average(
+                [
+                    torch.cat(validation[layer], dim=0)
+                    for layer in PROTOCOL.target_layers
+                ]
+            )
+        self.reporter.emit(
+            "feature_banks",
+            level="DEBUG",
+            training_shape=list(training_bank.shape),
+            validation_shape=list(validation_bank.shape),
+            rotations_enabled=rotations_enabled,
         )
-        validation_bank = self._normalize_and_average(
-            [torch.cat(validation[layer], dim=0) for layer in PROTOCOL.target_layers]
-        )
-        del training, validation
+        return training_bank, validation_bank
 
-        self.velocity_model = VelocityNetwork().to(self.device)
+    def _fit(
+        self,
+        support_images: torch.Tensor,
+        support_samples: list[Sample],
+        dataset: str,
+        category: str,
+    ) -> None:
+        if self.encoder is None:
+            raise RuntimeError("load_encoder() must be called first")
+        self.operating_time = None
+        self.fit_summary = {}
+        rotations_enabled = self._rotations_enabled(dataset, category)
+        view_count = len(support_images) * (
+            1
+            + (PROTOCOL.training_rotations if rotations_enabled else 0)
+            + PROTOCOL.validation_rotations
+        )
+        with self.reporter.stage(
+            "feature_extraction", view_count, "views", display="Extracting features"
+        ) as progress:
+            training_bank, validation_bank = self._feature_banks(
+                support_images, support_samples, rotations_enabled, progress
+            )
+
+        with self.reporter.stage("velocity_initialization"):
+            self.velocity_model = VelocityNetwork().to(self.device)
+        encoder_was_cuda = next(self.encoder.parameters()).device.type == "cuda"
+        if encoder_was_cuda:
+            with self.reporter.stage("encoder_offload"):
+                self.encoder.to("cpu")
+                torch.cuda.empty_cache()
+        try:
+            try:
+                with self.reporter.stage("feature_bank_transfer"):
+                    training_bank = training_bank.to(self.device)
+                    validation_bank = validation_bank.to(self.device)
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
+                        if self.reporter.verbose:
+                            free, total = torch.cuda.mem_get_info(self.device)
+                            self.reporter.emit(
+                                "gpu_memory",
+                                level="DEBUG",
+                                free_gib=free / 2**30,
+                                total_gib=total / 2**30,
+                            )
+            except torch.cuda.OutOfMemoryError as error:
+                raise RuntimeError(
+                    "The training and validation feature banks do not fit in GPU memory."
+                ) from error
+            self._train_velocity(training_bank, validation_bank)
+        finally:
+            del training_bank, validation_bank
+            torch.cuda.empty_cache()
+            if encoder_was_cuda:
+                with self.reporter.stage("encoder_restore"):
+                    self.encoder.to(self.device)
+                    torch.cuda.synchronize(self.device)
+
+        with self.reporter.stage(
+            "calibration",
+            PROTOCOL.calibration_rotations * len(support_samples),
+            "views",
+            key="calibration_features",
+            display="Calibration",
+        ) as progress:
+            progress.eta(None)
+            calibration_views = self._calibration_views(
+                support_images, support_samples, rotations_enabled, progress
+            )
+            self.operating_time = select_operating_time(
+                self.velocity_model,
+                category,
+                calibration_views,
+                self.device,
+                reporter=self.reporter,
+                progress=progress,
+            )
+        self.fit_summary["operating_time"] = self.operating_time
+
+    def _train_velocity(
+        self, training_bank: torch.Tensor, validation_bank: torch.Tensor
+    ) -> None:
         optimizer = torch.optim.AdamW(
             self.velocity_model.parameters(),
             lr=PROTOCOL.learning_rate,
@@ -275,93 +412,262 @@ class Flownomaly:
             T_max=PROTOCOL.maximum_epochs,
             eta_min=PROTOCOL.minimum_learning_rate,
         )
-        encoder_was_cuda = next(self.encoder.parameters()).device.type == "cuda"
-        if encoder_was_cuda:
-            self.encoder.to("cpu")
-            torch.cuda.empty_cache()
+        permutation_generator = torch.Generator(device=self.device)
+        permutation_generator.manual_seed(PROTOCOL.training_rotation_seed)
+        scaler = torch.amp.GradScaler("cuda")
+        best_loss = float("inf")
+        best_weights = None
+        best_epoch = None
+        patience = 0
+        schedule = validation_epochs(
+            PROTOCOL.maximum_epochs, PROTOCOL.validation_frequency
+        )
+        epoch_key = f"training_epoch:{len(training_bank)}"
+        epoch_rate = self.reporter.seconds_per_unit(
+            epoch_key, "tokens"
+        ) or self.reporter.seconds_per_unit("training_epoch", "tokens")
+        epoch_seconds = None if epoch_rate is None else epoch_rate * len(training_bank)
+        val_rate = self.reporter.seconds_per_unit(
+            f"validation:{len(validation_bank)}", "tokens"
+        ) or self.reporter.seconds_per_unit("validation", "tokens")
+        validation_seconds = (
+            None if val_rate is None else val_rate * len(validation_bank)
+        )
+        stop_reason = "maximum_epochs"
+        optimizer_steps = 0
+
+        def count_optimizer_step(_optimizer, _args, _kwargs):
+            nonlocal optimizer_steps
+            optimizer_steps += 1
+
+        # AMP can skip an optimizer step; count actual updates without reading GPU scalars.
+        step_hook = optimizer.register_step_post_hook(count_optimizer_step)
         try:
-            try:
-                training_bank = training_bank.to(self.device)
-                validation_bank = validation_bank.to(self.device)
-            except torch.cuda.OutOfMemoryError as error:
-                raise RuntimeError(
-                    "The published GPU-resident feature bank does not fit in VRAM."
-                ) from error
-            permutation_generator = torch.Generator(device=self.device)
-            permutation_generator.manual_seed(PROTOCOL.training_rotation_seed)
-            scaler = torch.amp.GradScaler("cuda")
-            best_loss = float("inf")
-            best_weights = None
-            patience = 0
-
-            for epoch in trange(PROTOCOL.maximum_epochs, desc=f"fit {category}"):
-                self.velocity_model.train()
-                permutation = torch.randperm(
-                    len(training_bank),
-                    generator=permutation_generator,
-                    device=self.device,
-                )
-                for start in range(0, len(training_bank), PROTOCOL.flow_batch_size):
-                    target = training_bank.index_select(
-                        0, permutation[start : start + PROTOCOL.flow_batch_size]
-                    ).float()
-                    noise = torch.randn_like(target)
-                    time = torch.rand((len(target), 1), device=self.device)
-                    state = time * target + (1.0 - time) * noise
-                    optimizer.zero_grad()
-                    with torch.amp.autocast(device_type="cuda", enabled=True):
-                        prediction = self.velocity_model(state, time)
-                        loss = torch.nn.functional.mse_loss(
-                            prediction.float(), (target - noise).float()
-                        )
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.velocity_model.parameters(), max_norm=1.0
+            with self.reporter.stage(
+                "training",
+                PROTOCOL.maximum_epochs,
+                "epochs",
+                display="Training",
+                key=f"training:{len(training_bank)}",
+                maximum_epochs=PROTOCOL.maximum_epochs,
+            ) as progress:
+                progress.eta(
+                    training_eta(
+                        0,
+                        PROTOCOL.maximum_epochs,
+                        epoch_seconds,
+                        validation_seconds,
+                        schedule,
                     )
-                    scaler.step(optimizer)
-                    scaler.update()
-                scheduler.step()
-
-                if (epoch + 1) % PROTOCOL.validation_frequency != 0 and (
-                    epoch + 1
-                ) != PROTOCOL.maximum_epochs:
-                    continue
-                validation_loss = self._fixed_validation_loss(validation_bank)
-                if validation_loss < best_loss - PROTOCOL.validation_minimum_delta:
-                    best_loss = validation_loss
-                    best_weights = copy.deepcopy(self.velocity_model.state_dict())
-                    patience = 0
-                else:
-                    patience += 1
-                if patience >= PROTOCOL.early_stopping_patience:
-                    break
-
-            if best_weights is None:
-                raise RuntimeError("no validation checkpoint was selected")
-            self.velocity_model.load_state_dict(best_weights)
-            self.velocity_model.eval()
-            for parameter in self.velocity_model.parameters():
-                parameter.grad = None
-                parameter.requires_grad_(False)
+                )
+                for epoch in range(1, PROTOCOL.maximum_epochs + 1):
+                    progress.set(epoch=epoch)
+                    epoch_started = time.monotonic()
+                    self.velocity_model.train()
+                    permutation = torch.randperm(
+                        len(training_bank),
+                        generator=permutation_generator,
+                        device=self.device,
+                    )
+                    loss_sum = torch.zeros((), device=self.device, dtype=torch.float64)
+                    tokens_seen = 0
+                    steps_before = optimizer_steps
+                    learning_rate = optimizer.param_groups[0]["lr"]
+                    detail_updated = time.monotonic()
+                    with self.reporter.stage(
+                        "training_epoch",
+                        len(training_bank),
+                        "tokens",
+                        key=epoch_key,
+                        epoch=epoch,
+                    ) as epoch_progress:
+                        for start in range(
+                            0, len(training_bank), PROTOCOL.flow_batch_size
+                        ):
+                            target = training_bank.index_select(
+                                0, permutation[start : start + PROTOCOL.flow_batch_size]
+                            ).float()
+                            noise = torch.randn_like(target)
+                            times = torch.rand((len(target), 1), device=self.device)
+                            state = times * target + (1.0 - times) * noise
+                            optimizer.zero_grad()
+                            with torch.amp.autocast(device_type="cuda", enabled=True):
+                                prediction = self.velocity_model(state, times)
+                                loss = torch.nn.functional.mse_loss(
+                                    prediction.float(), (target - noise).float()
+                                )
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer)
+                            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                                self.velocity_model.parameters(), max_norm=1.0
+                            )
+                            scaler.step(optimizer)
+                            scaler.update()
+                            loss_sum.add_(loss.detach().double() * len(target))
+                            tokens_seen += len(target)
+                            epoch_progress.advance(len(target))
+                            if (
+                                time.monotonic() - detail_updated
+                                >= self.reporter.interval
+                            ):
+                                progress.set(
+                                    train_loss=float(loss_sum.item()) / tokens_seen
+                                )
+                                detail_updated = time.monotonic()
+                        epoch_loss = float(loss_sum.item()) / tokens_seen
+                        norm = float(gradient_norm.item())
+                    scheduler.step()
+                    epoch_duration = time.monotonic() - epoch_started
+                    epoch_seconds = (
+                        epoch_duration
+                        if epoch <= 2
+                        else 0.7 * epoch_seconds + 0.3 * epoch_duration
+                    )
+                    skipped = math.ceil(
+                        len(training_bank) / PROTOCOL.flow_batch_size
+                    ) - (optimizer_steps - steps_before)
+                    if (
+                        not math.isfinite(epoch_loss)
+                        or not math.isfinite(norm)
+                        or skipped
+                    ):
+                        self.reporter.emit(
+                            "training_numerics",
+                            level="WARNING",
+                            epoch=epoch,
+                            nonfinite_loss=not math.isfinite(epoch_loss),
+                            nonfinite_gradient=not math.isfinite(norm),
+                            skipped_amp_updates=skipped,
+                        )
+                    self.reporter.emit(
+                        "epoch_metrics",
+                        epoch=epoch,
+                        train_loss=epoch_loss,
+                        gradient_norm=norm,
+                        learning_rate=learning_rate,
+                        next_learning_rate=optimizer.param_groups[0]["lr"],
+                        epoch_elapsed_s=epoch_duration,
+                        tokens_per_s=tokens_seen / epoch_duration,
+                        skipped_amp_updates=skipped,
+                        amp_scale=scaler.get_scale(),
+                    )
+                    if epoch in schedule:
+                        validation_started = time.monotonic()
+                        validation_loss = self._fixed_validation_loss(
+                            validation_bank, epoch=epoch
+                        )
+                        improvement = (
+                            best_loss - validation_loss
+                            if math.isfinite(best_loss)
+                            else None
+                        )
+                        improved = (
+                            validation_loss
+                            < best_loss - PROTOCOL.validation_minimum_delta
+                        )
+                        if improved:
+                            best_loss, best_epoch = validation_loss, epoch
+                            best_weights = copy.deepcopy(
+                                self.velocity_model.state_dict()
+                            )
+                            patience = 0
+                        else:
+                            patience += 1
+                        measured = time.monotonic() - validation_started
+                        validation_seconds = (
+                            measured
+                            if validation_seconds is None
+                            else 0.7 * validation_seconds + 0.3 * measured
+                        )
+                        if not math.isfinite(validation_loss):
+                            self.reporter.emit(
+                                "nonfinite_validation_loss",
+                                level="WARNING",
+                                epoch=epoch,
+                                error="validation loss is non-finite",
+                            )
+                        self.reporter.emit(
+                            "validation_result",
+                            epoch=epoch,
+                            train_loss=epoch_loss,
+                            validation_loss=validation_loss,
+                            best_validation_loss=best_loss,
+                            best_epoch=best_epoch,
+                            improvement=improvement,
+                            minimum_delta=PROTOCOL.validation_minimum_delta,
+                            selected=improved,
+                            patience=patience,
+                            patience_limit=PROTOCOL.early_stopping_patience,
+                            patience_unit="validation_checks",
+                            validation_elapsed_s=measured,
+                        )
+                        progress.set(validation_loss=validation_loss)
+                        if patience >= PROTOCOL.early_stopping_patience:
+                            stop_reason = "early_stopping"
+                    progress.advance()
+                    future = [check for check in schedule if check > epoch]
+                    checks_left = PROTOCOL.early_stopping_patience - patience
+                    if checks_left == 0:
+                        stop_epoch = epoch
+                    elif len(future) >= checks_left:
+                        stop_epoch = future[checks_left - 1]
+                    else:
+                        stop_epoch = None
+                    progress.eta(
+                        training_eta(
+                            epoch,
+                            PROTOCOL.maximum_epochs,
+                            epoch_seconds,
+                            validation_seconds,
+                            schedule,
+                        )
+                    )
+                    progress.set(
+                        train_loss=epoch_loss,
+                        best_validation_loss=best_loss,
+                        best_epoch=best_epoch,
+                        patience=f"{patience}/{PROTOCOL.early_stopping_patience} checks",
+                        early_stop_status="epoch_limit_first"
+                        if stop_epoch is None
+                        else "conditional",
+                        early_stop_if_no_improvement_eta_s=None
+                        if stop_epoch is None
+                        else training_eta(
+                            epoch,
+                            stop_epoch,
+                            epoch_seconds,
+                            validation_seconds,
+                            schedule,
+                        ),
+                    )
+                    if stop_reason == "early_stopping":
+                        break
+                if best_weights is None:
+                    raise RuntimeError("no validation checkpoint was selected")
+                with self.reporter.stage("restore_best_weights"):
+                    self.velocity_model.load_state_dict(best_weights)
+                    self.velocity_model.eval()
+                    for parameter in self.velocity_model.parameters():
+                        parameter.grad = None
+                        parameter.requires_grad_(False)
+                self.fit_summary = {
+                    "epochs": epoch,
+                    "best_epoch": best_epoch,
+                    "best_validation_loss": best_loss,
+                    "final_train_loss": epoch_loss,
+                    "stop_reason": stop_reason,
+                }
+                progress.total = epoch
+                progress.set(stop_reason=stop_reason)
         finally:
-            del training_bank, validation_bank
-            torch.cuda.empty_cache()
-            if encoder_was_cuda:
-                self.encoder.to(self.device)
-
-        calibration_views = self._calibration_views(
-            support_images, support_samples, rotations_enabled
-        )
-        self.operating_time = select_operating_time(
-            self.velocity_model, category, calibration_views, self.device
-        )
+            step_hook.remove()
 
     def _calibration_views(
         self,
         support_images: torch.Tensor,
         support_samples: list[Sample],
         rotations_enabled: bool,
+        progress: Stage,
     ) -> list[dict]:
         maximum_angle = PROTOCOL.maximum_rotation_angle if rotations_enabled else 0.0
         views = []
@@ -404,6 +710,7 @@ class Flownomaly:
                         "features": features.detach().cpu(),
                     }
                 )
+                progress.advance()
         return views
 
     @torch.no_grad()

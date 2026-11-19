@@ -22,6 +22,9 @@ htmlcov/
 /anomaly_maps/
 /feature_cache/
 /logs/
+/slurm-logs/
+/run-logs/
+/slurm-*.out
 *.pt
 *.pth
 *.h5
